@@ -115,6 +115,8 @@ async def send_recurring_reminder_async(task_id: str):
     """Async function to send recurring reminder"""
     from .telegram_bot import telegram_bot
     await telegram_bot.send_recurring_reminder(task_id)
+    
+  
 
 def schedule_daily_greeting():
     """Schedule daily greeting at 8:00 AM"""

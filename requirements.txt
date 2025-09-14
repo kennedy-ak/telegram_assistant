@@ -6,12 +6,10 @@ redis
 python-decouple
 django-environ
 psycopg2-binary
-google-api-python-client
-google-auth-httplib2
-google-auth-oauthlib
 APScheduler
 pytz
 python-dotenv
 gunicorn
 django-celery-beat
 whitenoise
+dj-database-url 

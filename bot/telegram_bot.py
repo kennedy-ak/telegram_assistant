@@ -5,6 +5,7 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
     CallbackQueryHandler, ContextTypes, filters
 )
+from telegram.error import Conflict
 from django.conf import settings
 from django.utils import timezone
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from .openai_service import OpenAIService
 from .scheduler import schedule_reminder
 import asyncio
 from asgiref.sync import sync_to_async
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -311,30 +313,57 @@ Just chat with me naturally! 🗣️
             await update.message.reply_text("❌ You are not authorized to use this bot.")
             return
         
-        user_message = update.message.text
+        user_message = update.message.text.lower()
         user_id = str(update.effective_user.id)
+        
+        # Check for task list queries first
+        task_queries = [
+            "what are my tasks for today",
+            "show me today's tasks", 
+            "what's on my schedule today",
+            "today's tasks",
+            "my tasks today",
+            "what do i have today"
+        ]
+        
+        if any(query in user_message for query in task_queries):
+            await self.today_command(update, context)
+            return
+        
+        # Check for weekly task queries
+        week_queries = [
+            "what are my tasks this week",
+            "show me this week's tasks",
+            "weekly tasks",
+            "my tasks this week"
+        ]
+        
+        if any(query in user_message for query in week_queries):
+            await self.week_command(update, context)
+            return
         
         # Get user profile and conversation context
         user_profile = await self.get_user_profile(user_id)
         conversation_context = await self.get_conversation_context(user_id)
         
-        # First, try to parse as a task
-        task_data = self.openai_service.parse_task_from_message(user_message)
+        # Try to parse as a task using original message (with case)
+        original_message = update.message.text
+        task_data = self.openai_service.parse_task_from_message(original_message)
         
         if task_data:
-            await self.create_task_from_parsed_data(update, task_data, user_message)
+            await self.create_task_from_parsed_data(update, task_data, original_message)
         else:
             # Get conversational response with context and profile
             try:
                 response = self.openai_service.get_assistant_response(
-                    user_message, 
+                    original_message, 
                     conversation_context, 
                     user_profile
                 )
                 await update.message.reply_text(response)
                 
                 # Update conversation context
-                await self.update_conversation_context(user_id, user_message, response)
+                await self.update_conversation_context(user_id, original_message, response)
                 
             except Exception as e:
                 logger.error(f"Error handling message: {e}")
@@ -343,7 +372,7 @@ Just chat with me naturally! 🗣️
         # Log the conversation
         await sync_to_async(BotLog.objects.create)(
             log_type='info',
-            message=f'Conversation: {user_message[:100]}',
+            message=f'Conversation: {original_message[:100]}',
             extra_data={'response_type': 'task' if task_data else 'conversation'}
         )
     
@@ -352,7 +381,78 @@ Just chat with me naturally! 🗣️
         query = update.callback_query
         await query.answer()
         
-        if query.data.startswith("complete_"):
+        if query.data.startswith("priority_"):
+            # Handle priority selection for task creation
+            parts = query.data.split("_", 2)
+            selected_priority = parts[1]
+            
+            user_id = str(query.from_user.id)
+            temp_task_key = f"temp_task_{user_id}"
+            
+            try:
+                # Get temporary task data
+                conversation = await sync_to_async(Conversation.objects.get)(session_id=user_id)
+                temp_task_data = conversation.context.get(temp_task_key)
+                
+                if not temp_task_data:
+                    await query.edit_message_text("❌ Task data not found. Please try creating the task again.")
+                    return
+                
+                # Parse due time if provided
+                due_time = None
+                if temp_task_data.get('due_time'):
+                    try:
+                        due_time = datetime.fromisoformat(temp_task_data['due_time'].replace('Z', '+00:00'))
+                        if due_time.tzinfo is None:
+                            due_time = timezone.make_aware(due_time)
+                    except Exception as e:
+                        logger.error(f"Error parsing due_time: {e}")
+                        due_time = None
+                
+                # Create the task with selected priority
+                task = await sync_to_async(Task.objects.create)(
+                    title=temp_task_data['title'],
+                    description=temp_task_data.get('description', ''),
+                    due_time=due_time,
+                    priority=selected_priority,
+                    telegram_message_id=temp_task_data.get('telegram_message_id')
+                )
+                
+                # Schedule reminder if due time is set
+                if task.due_time:
+                    await sync_to_async(schedule_reminder)(task)
+                
+                # Clean up temporary data
+                del conversation.context[temp_task_key]
+                await sync_to_async(conversation.save)()
+                
+                # Send confirmation
+                priority_emoji = self.get_priority_emoji(selected_priority)
+                response = f"✅ **Task Created with {priority_emoji} {selected_priority.title()} Priority:**\n\n📝 {task.title}"
+                if task.description:
+                    response += f"\n💭 {task.description}"
+                if task.due_time:
+                    response += f"\n⏰ Due: {task.due_time.strftime('%B %d, %Y at %I:%M %p')}"
+                
+                if task.due_time and task.due_time.date() == timezone.now().date():
+                    response += "\n\n💪 You've got this! I'll remind you before it's due."
+                
+                await query.edit_message_text(response, parse_mode='Markdown')
+                
+                # Log task creation
+                await sync_to_async(BotLog.objects.create)(
+                    log_type='task_created',
+                    message=f'Task created with priority selection: {task.title}',
+                    extra_data={'task_id': str(task.id), 'priority': selected_priority}
+                )
+                
+            except Conversation.DoesNotExist:
+                await query.edit_message_text("❌ Session not found. Please try creating the task again.")
+            except Exception as e:
+                logger.error(f"Error creating task from priority selection: {e}")
+                await query.edit_message_text("❌ Error creating task. Please try again.")
+        
+        elif query.data.startswith("complete_"):
             task_id = query.data.split("_", 1)[1]
             try:
                 task = await sync_to_async(Task.objects.get)(id=task_id)
@@ -434,11 +534,52 @@ Just chat with me naturally! 🗣️
                     logger.error(f"Error parsing due_time: {e}")
                     due_time = None
             
+            # Check if priority was explicitly mentioned, if not ask user
+            priority = task_data.get('priority', 'medium')
+            priority_was_explicit = self.check_if_priority_explicit(original_message)
+            
+            if not priority_was_explicit:
+                # Show priority selection options
+                keyboard = [
+                    [InlineKeyboardButton("🔴 Urgent", callback_data=f"priority_urgent_{task_data['title'][:50]}")],
+                    [InlineKeyboardButton("🟠 High", callback_data=f"priority_high_{task_data['title'][:50]}")],
+                    [InlineKeyboardButton("🟡 Medium", callback_data=f"priority_medium_{task_data['title'][:50]}")],
+                    [InlineKeyboardButton("🟢 Low", callback_data=f"priority_low_{task_data['title'][:50]}")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                # Store task data temporarily for later creation
+                user_id = str(update.effective_user.id)
+                temp_task_key = f"temp_task_{user_id}"
+                
+                # Store in conversation context temporarily
+                conversation = await sync_to_async(Conversation.objects.get_or_create)(
+                    session_id=user_id,
+                    defaults={'context': {"messages": []}}
+                )[0]
+                
+                conversation.context[temp_task_key] = {
+                    'title': task_data['title'],
+                    'description': task_data.get('description', ''),
+                    'due_time': task_data.get('due_time'),
+                    'original_message': original_message,
+                    'telegram_message_id': update.message.message_id
+                }
+                await sync_to_async(conversation.save)()
+                
+                await update.message.reply_text(
+                    f"📝 **Task:** {task_data['title']}\n\n🔥 **What's the priority level for this task?**",
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+                return
+            
+            # Create task with specified priority
             task = await sync_to_async(Task.objects.create)(
                 title=task_data['title'],
                 description=task_data.get('description', ''),
                 due_time=due_time,
-                priority=task_data.get('priority', 'medium'),
+                priority=priority,
                 telegram_message_id=update.message.message_id
             )
             
@@ -446,19 +587,8 @@ Just chat with me naturally! 🗣️
             if task.due_time:
                 await sync_to_async(schedule_reminder)(task)
             
-            # Prepare response message
-            response = f"✅ **Task Added:**\n\n📝 {task.title}"
-            if task.description:
-                response += f"\n💭 {task.description}"
-            if task.due_time:
-                response += f"\n⏰ Due: {task.due_time.strftime('%B %d, %Y at %I:%M %p')}"
-            response += f"\n🔥 Priority: {task.get_priority_display()}"
-            
-            # Add motivational message
-            if task.due_time and task.due_time.date() == timezone.now().date():
-                response += "\n\n💪 You've got this! I'll remind you before it's due."
-            
-            await update.message.reply_text(response, parse_mode='Markdown')
+            # Send confirmation message
+            await self.send_task_confirmation(update, task)
             
             # Log task creation
             await sync_to_async(BotLog.objects.create)(
@@ -470,6 +600,32 @@ Just chat with me naturally! 🗣️
         except Exception as e:
             logger.error(f"Error creating task: {e}")
             await update.message.reply_text("❌ Sorry, I couldn't create that task. Could you try rephrasing it?")
+    
+    def check_if_priority_explicit(self, message: str) -> bool:
+        """Check if priority was explicitly mentioned in the message"""
+        priority_keywords = [
+            'urgent', 'asap', 'immediately', 'critical', 'emergency',
+            'high priority', 'important', 'high', 'must do',
+            'low priority', 'low', 'when i can', 'not urgent', 'later',
+            'medium priority', 'medium', 'normal'
+        ]
+        message_lower = message.lower()
+        return any(keyword in message_lower for keyword in priority_keywords)
+    
+    async def send_task_confirmation(self, update: Update, task):
+        """Send task creation confirmation message"""
+        response = f"✅ **Task Added:**\n\n📝 {task.title}"
+        if task.description:
+            response += f"\n💭 {task.description}"
+        if task.due_time:
+            response += f"\n⏰ Due: {task.due_time.strftime('%B %d, %Y at %I:%M %p')}"
+        response += f"\n🔥 Priority: {task.get_priority_display()}"
+        
+        # Add motivational message
+        if task.due_time and task.due_time.date() == timezone.now().date():
+            response += "\n\n💪 You've got this! I'll remind you before it's due."
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
     
     def get_priority_emoji(self, priority: str) -> str:
         """Get emoji for task priority"""
